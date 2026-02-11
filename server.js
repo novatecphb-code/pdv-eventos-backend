@@ -1,0 +1,330 @@
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+const EVENT_ID = Number(process.env.EVENT_ID || 1);
+
+// Helper: cria o dia se não existir, ou reabre se existir fechado
+async function getOrCreateOpenDay(day_date) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const existing = await client.query(
+      `
+      SELECT id, is_open
+      FROM event_days
+      WHERE event_id = $1 AND day_date = $2
+      LIMIT 1
+      `,
+      [EVENT_ID, day_date]
+    );
+
+    if (existing.rows.length) {
+      const row = existing.rows[0];
+
+      if (!row.is_open) {
+        await client.query(
+          `
+          UPDATE event_days
+          SET is_open = true, opened_at = now(), closed_at = NULL
+          WHERE id = $1
+          `,
+          [row.id]
+        );
+      }
+
+      await client.query("COMMIT");
+      return row.id;
+    }
+
+    const created = await client.query(
+      `
+      INSERT INTO event_days (event_id, day_date, is_open)
+      VALUES ($1, $2, true)
+      RETURNING id
+      `,
+      [EVENT_ID, day_date]
+    );
+
+    await client.query("COMMIT");
+    return created.rows[0].id;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// 1) Listar produtos
+app.get("/api/products", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT id, name, cost, price, active FROM products WHERE active = true ORDER BY id"
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 2) Abrir dia + lançar estoque inicial (OPENING apenas 1 vez)
+//    Se já tiver OPENING, não dá erro: só retorna already_open=true
+app.post("/api/day/open", async (req, res) => {
+  const { day_date, opening } = req.body;
+
+  if (!day_date || !Array.isArray(opening) || opening.length === 0) {
+    return res.status(400).json({ error: "day_date e opening são obrigatórios" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const dayId = await getOrCreateOpenDay(day_date);
+
+    const exists = await client.query(
+      `
+      SELECT 1 FROM inventory_movements
+      WHERE event_day_id = $1 AND type = 'OPENING'
+      LIMIT 1
+      `,
+      [dayId]
+    );
+
+    if (exists.rows.length) {
+      await client.query("COMMIT");
+      return res.json({ ok: true, event_day_id: dayId, already_open: true });
+    }
+
+    for (const item of opening) {
+      const pid = Number(item.product_id);
+      const qty = Number(item.qty);
+      if (!pid || !qty || qty <= 0) continue;
+
+      await client.query(
+        `
+        INSERT INTO inventory_movements (event_day_id, product_id, type, qty)
+        VALUES ($1, $2, 'OPENING', $3)
+        `,
+        [dayId, pid, qty]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({ ok: true, event_day_id: dayId, already_open: false });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 3) Estoque atual do dia
+app.get("/api/day/:dayId/stock", async (req, res) => {
+  const dayId = Number(req.params.dayId);
+  try {
+    const { rows } = await pool.query(
+      `
+      SELECT
+        p.id,
+        p.name,
+        COALESCE(SUM(CASE WHEN im.type IN ('OPENING','RESTOCK') THEN im.qty ELSE 0 END),0)
+        -
+        COALESCE(SUM(CASE WHEN im.type = 'SALE' THEN im.qty ELSE 0 END),0)
+        AS stock_now
+      FROM products p
+      LEFT JOIN inventory_movements im
+        ON im.product_id = p.id AND im.event_day_id = $1
+      WHERE p.active = true
+      GROUP BY p.id, p.name
+      ORDER BY p.id
+      `,
+      [dayId]
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 4) Vender (registra sale + baixa estoque)
+app.post("/api/sale", async (req, res) => {
+  const { event_day_id, product_id, qty, payment_method } = req.body;
+
+  if (!event_day_id || !product_id || !qty || qty <= 0 || !payment_method) {
+    return res.status(400).json({ error: "Dados inválidos" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // valida dia aberto
+    const day = await client.query(
+      "SELECT is_open FROM event_days WHERE id = $1",
+      [event_day_id]
+    );
+    if (!day.rows.length || !day.rows[0].is_open) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "Dia inválido ou fechado." });
+    }
+
+    // pega preço e custo do produto
+    const prod = await client.query(
+      "SELECT price, cost FROM products WHERE id = $1 AND active = true",
+      [product_id]
+    );
+    if (!prod.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Produto não encontrado." });
+    }
+
+    const unit_price = Number(prod.rows[0].price);
+    const unit_cost = Number(prod.rows[0].cost);
+
+    // estoque atual
+    const stockQ = await client.query(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN type IN ('OPENING','RESTOCK') THEN qty ELSE 0 END),0)
+        - COALESCE(SUM(CASE WHEN type = 'SALE' THEN qty ELSE 0 END),0) AS stock_now
+      FROM inventory_movements
+      WHERE event_day_id = $1 AND product_id = $2
+      `,
+      [event_day_id, product_id]
+    );
+
+    const stock_now = Number(stockQ.rows[0].stock_now);
+    if (stock_now < qty) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: `Estoque insuficiente. Atual: ${stock_now}` });
+    }
+
+    await client.query(
+      `
+      INSERT INTO sales (event_day_id, product_id, qty, unit_price, unit_cost, payment_method)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [event_day_id, product_id, qty, unit_price, unit_cost, payment_method]
+    );
+
+    await client.query(
+      `
+      INSERT INTO inventory_movements (event_day_id, product_id, type, qty)
+      VALUES ($1, $2, 'SALE', $3)
+      `,
+      [event_day_id, product_id, qty]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+// 5) Resumo do dia
+app.get("/api/day/:dayId/summary", async (req, res) => {
+  const dayId = Number(req.params.dayId);
+
+  try {
+    const base = await pool.query(
+      `
+      SELECT
+        COALESCE(SUM(qty * unit_price),0) AS faturamento,
+        COALESCE(SUM(qty * unit_cost),0) AS custo
+      FROM sales
+      WHERE event_day_id = $1
+      `,
+      [dayId]
+    );
+
+    const porPagamento = await pool.query(
+      `
+      SELECT payment_method, COALESCE(SUM(qty * unit_price),0) AS total
+      FROM sales
+      WHERE event_day_id = $1
+      GROUP BY payment_method
+      ORDER BY payment_method
+      `,
+      [dayId]
+    );
+
+    const cfg = await pool.query(
+      `
+      SELECT percent, vendor_count
+      FROM event_commission_config
+      WHERE event_id = $1
+      LIMIT 1
+      `,
+      [EVENT_ID]
+    );
+
+    const faturamento = Number(base.rows[0].faturamento);
+    const custo = Number(base.rows[0].custo);
+    const lucroBruto = faturamento - custo;
+
+    const percent = Number(cfg.rows[0]?.percent || 0);
+    const vendors = Number(cfg.rows[0]?.vendor_count || 0);
+
+    const comissao = vendors * 40 + faturamento * (percent / 100);
+    const lucroLiquido = faturamento - custo - comissao;
+
+    res.json({
+      faturamento,
+      custo,
+      lucro_bruto: lucroBruto,
+      comissao,
+      lucro_liquido: lucroLiquido,
+      por_pagamento: porPagamento.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 6) Fechar dia (bloqueia vendas)
+app.post("/api/day/:dayId/close", async (req, res) => {
+  const dayId = Number(req.params.dayId);
+
+  try {
+    const r = await pool.query(
+      `
+      UPDATE event_days
+      SET is_open = false, closed_at = now()
+      WHERE id = $1 AND is_open = true
+      RETURNING id
+      `,
+      [dayId]
+    );
+
+    if (!r.rows.length) {
+      return res.status(400).json({ error: "Dia já está fechado ou inválido." });
+    }
+
+    res.json({ ok: true, day_id: dayId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ✅ sempre por último
+app.get("/health", (req, res) => res.json({ ok: true }));
+app.listen(process.env.PORT || 3001, "0.0.0.0", () => {
+  console.log("🔥 PDV Eventos API rodando na porta", process.env.PORT || 3001);
+});
