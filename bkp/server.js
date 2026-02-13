@@ -9,10 +9,6 @@ app.use(express.json());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Render Postgres costuma exigir SSL:
-  ssl: process.env.DATABASE_URL?.includes("render.com") || process.env.DATABASE_URL?.includes("onrender.com")
-    ? { rejectUnauthorized: false }
-    : false,
 });
 
 const EVENT_ID = Number(process.env.EVENT_ID || 1);
@@ -83,7 +79,7 @@ app.get("/api/products", async (req, res) => {
 });
 
 // 2) Abrir dia + lançar estoque inicial (OPENING apenas 1 vez)
-// Se já tiver OPENING, não dá erro: retorna already_open=true
+//    Se já tiver OPENING, não dá erro: só retorna already_open=true
 app.post("/api/day/open", async (req, res) => {
   const { day_date, opening } = req.body;
 
@@ -328,6 +324,7 @@ app.post("/api/day/:dayId/close", async (req, res) => {
 });
 
 // ✅ sempre por último
+app.get("/health", (req, res) => res.json({ ok: true }));
 app.listen(process.env.PORT || 3001, "0.0.0.0", () => {
   console.log("🔥 PDV Eventos API rodando na porta", process.env.PORT || 3001);
 });
