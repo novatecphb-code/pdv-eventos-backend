@@ -1,23 +1,136 @@
+// server.js
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 
 const app = express();
+
+// CORS (local): libera tudo por enquanto
 app.use(cors());
 app.use(express.json());
 
+// Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Render Postgres costuma exigir SSL:
-  ssl: process.env.DATABASE_URL?.includes("render.com") || process.env.DATABASE_URL?.includes("onrender.com")
-    ? { rejectUnauthorized: false }
-    : false,
+  ssl:
+    process.env.DATABASE_URL?.includes("render.com") ||
+    process.env.DATABASE_URL?.includes("onrender.com")
+      ? { rejectUnauthorized: false }
+      : false,
 });
 
 const EVENT_ID = Number(process.env.EVENT_ID || 1);
 
+// Health check
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, service: "pdv-eventos-api", time: new Date().toISOString() });
+});
+
+// =====================
+// AUTH helpers
+// =====================
+function auth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ message: "Token ausente" });
+
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET); // { id, role, name }
+    return next();
+  } catch {
+    return res.status(401).json({ message: "Token inválido" });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user?.role) return res.status(401).json({ message: "Não autenticado" });
+    if (!roles.includes(req.user.role)) return res.status(403).json({ message: "Sem permissão" });
+    return next();
+  };
+}
+
+// =====================
+// AUTH routes
+// =====================
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ message: "Informe email e senha" });
+
+  const q = await pool.query(
+    `SELECT id, name, email, password_hash, role, active
+     FROM users
+     WHERE email = $1
+     LIMIT 1`,
+    [String(email).toLowerCase().trim()]
+  );
+
+  if (!q.rows.length) return res.status(401).json({ message: "Credenciais inválidas" });
+
+  const user = q.rows[0];
+  if (!user.active) return res.status(403).json({ message: "Usuário desativado" });
+
+  const ok = await bcrypt.compare(String(password), user.password_hash);
+  if (!ok) return res.status(401).json({ message: "Credenciais inválidas" });
+
+  const token = jwt.sign(
+    { id: user.id, role: user.role, name: user.name },
+    process.env.JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+
+  return res.json({
+    accessToken: token,
+    user: { id: user.id, name: user.name, email: user.email, role: user.role },
+  });
+});
+
+app.get("/api/me", auth, async (req, res) => {
+  const q = await pool.query(
+    `SELECT id, name, email, role, active, created_at
+     FROM users
+     WHERE id = $1
+     LIMIT 1`,
+    [req.user.id]
+  );
+  if (!q.rows.length) return res.status(404).json({ message: "Usuário não encontrado" });
+  return res.json(q.rows[0]);
+});
+
+app.post("/api/users", auth, requireRole("ADMIN"), async (req, res) => {
+  const { name, email, password, role } = req.body || {};
+  if (!name || !email || !password || !role) {
+    return res.status(400).json({ message: "name, email, password, role são obrigatórios" });
+  }
+  if (!["ADMIN", "SELLER"].includes(role)) {
+    return res.status(400).json({ message: "role inválido (ADMIN/SELLER)" });
+  }
+
+  const password_hash = await bcrypt.hash(String(password), 10);
+
+  try {
+    const r = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role, active)
+       VALUES ($1, $2, $3, $4, true)
+       RETURNING id, name, email, role, active, created_at`,
+      [String(name).trim(), String(email).toLowerCase().trim(), password_hash, role]
+    );
+    return res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (String(e?.message || "").includes("users_email_key")) {
+      return res.status(409).json({ message: "Email já cadastrado" });
+    }
+    console.error(e);
+    return res.status(500).json({ message: "Erro ao criar usuário" });
+  }
+});
+
+// =====================
 // Helper: cria o dia se não existir, ou reabre se existir fechado
+// =====================
 async function getOrCreateOpenDay(day_date) {
   const client = await pool.connect();
   try {
@@ -70,6 +183,10 @@ async function getOrCreateOpenDay(day_date) {
   }
 }
 
+// =====================
+// SUAS ROTAS ATUAIS
+// =====================
+
 // 1) Listar produtos
 app.get("/api/products", async (req, res) => {
   try {
@@ -83,7 +200,6 @@ app.get("/api/products", async (req, res) => {
 });
 
 // 2) Abrir dia + lançar estoque inicial (OPENING apenas 1 vez)
-// Se já tiver OPENING, não dá erro: retorna already_open=true
 app.post("/api/day/open", async (req, res) => {
   const { day_date, opening } = req.body;
 
@@ -175,17 +291,12 @@ app.post("/api/sale", async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // valida dia aberto
-    const day = await client.query(
-      "SELECT is_open FROM event_days WHERE id = $1",
-      [event_day_id]
-    );
+    const day = await client.query("SELECT is_open FROM event_days WHERE id = $1", [event_day_id]);
     if (!day.rows.length || !day.rows[0].is_open) {
       await client.query("ROLLBACK");
       return res.status(400).json({ error: "Dia inválido ou fechado." });
     }
 
-    // pega preço e custo do produto
     const prod = await client.query(
       "SELECT price, cost FROM products WHERE id = $1 AND active = true",
       [product_id]
@@ -198,7 +309,6 @@ app.post("/api/sale", async (req, res) => {
     const unit_price = Number(prod.rows[0].price);
     const unit_cost = Number(prod.rows[0].cost);
 
-    // estoque atual
     const stockQ = await client.query(
       `
       SELECT
@@ -302,7 +412,7 @@ app.get("/api/day/:dayId/summary", async (req, res) => {
   }
 });
 
-// 6) Fechar dia (bloqueia vendas)
+// 6) Fechar dia
 app.post("/api/day/:dayId/close", async (req, res) => {
   const dayId = Number(req.params.dayId);
 
